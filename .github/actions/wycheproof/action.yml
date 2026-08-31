@@ -5,8 +5,19 @@ runs:
   using: "composite"
 
   steps:
-    - uses: actions/checkout@v3.5.2
+    - uses: actions/checkout@v4
       with:
         repository: "google/wycheproof"
         path: "wycheproof"
-        ref: "master"
+        # google/wycheproof renamed its default branch master -> main, so
+        # `git fetch +refs/heads/master*` matched nothing and actions/checkout
+        # exited 1 after 3 retries, before any test could run.
+        #
+        # `main` is not usable either: the branch has since reorganised
+        # testvectors/, dropping the files this release's suite loads
+        # (rsa_pkcs1_2048_test.json, x25519_test.json, x448_test.json), so the
+        # macOS/Windows legs died with FileNotFoundError. Pinned to the last
+        # commit before cryptography 41.0.7's release date (2023-10-28), where
+        # the old testvectors/ layout is still intact -- a SHA also makes the
+        # vectors reproducible, which a moving branch never is.
+        ref: "cd5d271eab5c841f734d044683e4e30b76f65abb"

@@ -1,8 +1,6 @@
 name: Auto-close stale issues
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
 
 permissions:
   issues: "write"
@@ -10,6 +8,7 @@ permissions:
 
 jobs:
   auto-close:
+    timeout-minutes: 15
     if: github.repository_owner == 'pyca'
     runs-on: ubuntu-latest
     steps:

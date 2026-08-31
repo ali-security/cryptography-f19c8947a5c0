@@ -20,8 +20,21 @@ if [[ "${TYPE}" == "openssl" ]]; then
     pushd openssl
     git checkout "${VERSION}"
   else
-    curl -O "https://www.openssl.org/source/openssl-${VERSION}.tar.gz"
+    # www.openssl.org/source no longer serves these tarballs: the request comes
+    # back as a 169-byte redirect stub, so `tar zxf` died with
+    # "gzip: stdin: not in gzip format". Fetch the GitHub tag archive instead.
+    # Tag naming differs by series: 3.x is "openssl-3.1.3", 1.x is
+    # "OpenSSL_1_1_1v".
+    if [[ "${VERSION}" =~ ^1\. ]]; then
+      OPENSSL_TAG="OpenSSL_${VERSION//./_}"
+    else
+      OPENSSL_TAG="openssl-${VERSION}"
+    fi
+    curl -L -o "openssl-${VERSION}.tar.gz" "https://github.com/openssl/openssl/archive/refs/tags/${OPENSSL_TAG}.tar.gz"
     tar zxf "openssl-${VERSION}.tar.gz"
+    # The tag archive extracts to <repo>-<tag>, so normalise the directory name
+    # back to what the rest of this script expects.
+    mv "openssl-${OPENSSL_TAG}" "openssl-${VERSION}"
     pushd "openssl-${VERSION}"
   fi
   # For OpenSSL 3 we need to call this before config
@@ -57,7 +70,7 @@ if [[ "${TYPE}" == "openssl" ]]; then
   fi
   popd
 elif [[ "${TYPE}" == "libressl" ]]; then
-  curl -O "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-${VERSION}.tar.gz"
+  curl -L -O "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-${VERSION}.tar.gz"
   tar zxf "libressl-${VERSION}.tar.gz"
   pushd "libressl-${VERSION}"
   ./config -Wl -Wl,-Bsymbolic-functions -fPIC shared --prefix="${OSSL_PATH}"

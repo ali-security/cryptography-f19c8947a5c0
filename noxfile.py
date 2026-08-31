@@ -8,6 +8,7 @@ import glob
 import itertools
 import json
 import pathlib
+import platform
 import re
 import sys
 import typing
@@ -224,6 +225,10 @@ def process_rust_coverage(
     # Hitting weird issues merging Windows and Linux Rust coverage, so just
     # say the hell with it.
     if sys.platform == "win32":
+        return
+
+    # Ignore when running on aarch64
+    if platform.machine() in ("aarch64", "arm64", "arm"):
         return
 
     target_libdir = session.run(

@@ -1,14 +1,13 @@
 name: Lock Issues
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
 
 permissions:
   issues: "write"
 
 jobs:
   lock:
+    timeout-minutes: 15
     if: github.repository_owner == 'pyca'
     runs-on: ubuntu-latest
     steps:

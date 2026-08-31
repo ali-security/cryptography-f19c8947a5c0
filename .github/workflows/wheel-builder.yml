@@ -6,53 +6,71 @@ on:
     inputs:
       version:
         description: The version to build
-  # Do not add any non-tag push events without updating pypi-publish.yml. If
-  # you do, it'll upload wheels to PyPI.
-  push:
-    tags:
-      - '*.*'
-      - '*.*.*'
-  pull_request:
-    paths:
-      - .github/workflows/wheel-builder.yml
-      - setup.py
-      - pyproject.toml
-      - vectors/pyproject.toml
 
 env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # The public 41.0.7 wheels were produced by `bdist_wheel (0.42.0)`. setuptools
+  # >= 70.1 vendors its own bdist_wheel and stamps `setuptools (<ver>)` into
+  # WHEEL instead, so every leg that builds a wheel pins setuptools < 70.1 and
+  # wheel == 0.42.0 (including inside pip's isolated build envs, via
+  # PIP_CONSTRAINT).
+  SEAL_SETUPTOOLS_PIN: "setuptools<70.1"
+  SEAL_WHEEL_PIN: "wheel==0.42.0"
+  # cffi 2.x declares its metadata with PEP 639 `project.license`, which the
+  # setuptools < 70.1 pinned above cannot parse -- any leg that has to build
+  # cffi from its sdist dies with
+  # "ValueError: invalid pyproject.toml config: 'project.license'".
+  # cffi < 2 is what cryptography 41.0.7 shipped against anyway, so it goes
+  # into the same constraints file as the Generator pins.
+  SEAL_CFFI_PIN: "cffi<2"
+  SEAL_OPENSSL_URL: "https://github.com/openssl/openssl/archive/refs/tags/openssl-3.1.3.tar.gz"
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
     name: sdists
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3.5.2
+      - uses: actions/checkout@v4
         with:
           # The tag to build or the tag received by the tag event
           ref: ${{ github.event.inputs.version || github.ref }}
           persist-credentials: false
 
+      - name: Pin the wheel Generator toolchain
+        run: |
+          printf '%s\n%s\n%s\n' "$SEAL_SETUPTOOLS_PIN" "$SEAL_WHEEL_PIN" "$SEAL_CFFI_PIN" > "${{ github.workspace }}/seal-constraints.txt"
+          echo "PIP_CONSTRAINT=${{ github.workspace }}/seal-constraints.txt" >> $GITHUB_ENV
       - run: python -m venv .venv
       - name: Install Python dependencies
-        run: .venv/bin/pip install -U pip build
+        run: .venv/bin/pip install -U pip build "$SEAL_SETUPTOOLS_PIN" "$SEAL_WHEEL_PIN"
       - name: Make sdist (cryptography)
         run: .venv/bin/python -m build --sdist
       - name: Make sdist and wheel (vectors)
         run: cd vectors/ && ../.venv/bin/python -m build
-      - uses: actions/upload-artifact@v3.1.2
+      - uses: actions/upload-artifact@v4
         with:
           name: "cryptography-sdist"
           path: dist/cryptography*
-      - uses: actions/upload-artifact@v3.1.2
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
         with:
           name: "vectors-sdist-wheel"
           path: vectors/dist/cryptography*
+          if-no-files-found: error
 
   manylinux:
+    # NOT a container job, for two independent reasons:
+    #  * musllinux: GitHub's Node 24 JS-action runtime is glibc-only
+    #    ("Error relocating /__e/node24_alpine/bin/node: pthread_getname_np:
+    #    symbol not found"), so the job died at actions/download-artifact.
+    #  * manylinux_2_28: the moving `ghcr.io/pyca/cryptography-manylinux_2_28`
+    #    tag no longer ships /opt/python/cp37-cp37m, so the venv step exited 127.
+    # The JS actions now run on the host and the identical build happens inside
+    # the pinned image via `docker run`, exactly like the manylinux2014 job.
     needs: [sdist]
     runs-on: ${{ matrix.MANYLINUX.RUNNER }}
-    container: ghcr.io/pyca/${{ matrix.MANYLINUX.CONTAINER }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -62,13 +80,11 @@ jobs:
           - { VERSION: "pp39-pypy39_pp73" }
           - { VERSION: "pp310-pypy310_pp73" }
         MANYLINUX:
-          - { NAME: "manylinux2014_x86_64", CONTAINER: "cryptography-manylinux2014:x86_64", RUNNER: "ubuntu-latest" }
           - { NAME: "manylinux_2_28_x86_64", CONTAINER: "cryptography-manylinux_2_28:x86_64", RUNNER: "ubuntu-latest"}
           - { NAME: "musllinux_1_1_x86_64", CONTAINER: "cryptography-musllinux_1_1:x86_64", RUNNER: "ubuntu-latest"}
 
-          - { NAME: "manylinux2014_aarch64", CONTAINER: "cryptography-manylinux2014_aarch64", RUNNER: [self-hosted, Linux, ARM64] }
-          - { NAME: "manylinux_2_28_aarch64", CONTAINER: "cryptography-manylinux_2_28:aarch64", RUNNER: [self-hosted, Linux, ARM64]}
-          - { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: [self-hosted, Linux, ARM64]}
+          - { NAME: "manylinux_2_28_aarch64", CONTAINER: "cryptography-manylinux_2_28:aarch64", RUNNER: "ubuntu-24.04-arm"}
+          - { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: "ubuntu-24.04-arm"}
         exclude:
           # There are no readily available musllinux PyPy distributions
           - PYTHON: { VERSION: "pp38-pypy38_pp73" }
@@ -78,82 +94,250 @@ jobs:
           - PYTHON: { VERSION: "pp310-pypy310_pp73" }
             MANYLINUX: { NAME: "musllinux_1_1_x86_64", CONTAINER: "cryptography-musllinux_1_1:x86_64", RUNNER: "ubuntu-latest"}
           - PYTHON: { VERSION: "pp38-pypy38_pp73" }
-            MANYLINUX: { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: [self-hosted, Linux, ARM64]}
+            MANYLINUX: { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: "ubuntu-24.04-arm"}
           - PYTHON: { VERSION: "pp39-pypy39_pp73" }
-            MANYLINUX: { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: [self-hosted, Linux, ARM64]}
+            MANYLINUX: { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: "ubuntu-24.04-arm"}
           - PYTHON: { VERSION: "pp310-pypy310_pp73" }
-            MANYLINUX: { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: [self-hosted, Linux, ARM64]}
-          # We also don't build pypy wheels for anything except the latest manylinux
-          - PYTHON: { VERSION: "pp38-pypy38_pp73" }
-            MANYLINUX: { NAME: "manylinux2014_x86_64", CONTAINER: "cryptography-manylinux2014:x86_64", RUNNER: "ubuntu-latest"}
-          - PYTHON: { VERSION: "pp39-pypy39_pp73" }
-            MANYLINUX: { NAME: "manylinux2014_x86_64", CONTAINER: "cryptography-manylinux2014:x86_64", RUNNER: "ubuntu-latest"}
-          - PYTHON: { VERSION: "pp310-pypy310_pp73" }
-            MANYLINUX: { NAME: "manylinux2014_x86_64", CONTAINER: "cryptography-manylinux2014:x86_64", RUNNER: "ubuntu-latest"}
-          - PYTHON: { VERSION: "pp38-pypy38_pp73" }
-            MANYLINUX: { NAME: "manylinux2014_aarch64", CONTAINER: "cryptography-manylinux2014_aarch64", RUNNER: [self-hosted, Linux, ARM64]}
-          - PYTHON: { VERSION: "pp39-pypy39_pp73" }
-            MANYLINUX: { NAME: "manylinux2014_aarch64", CONTAINER: "cryptography-manylinux2014_aarch64", RUNNER: [self-hosted, Linux, ARM64]}
-          - PYTHON: { VERSION: "pp310-pypy310_pp73" }
-            MANYLINUX: { NAME: "manylinux2014_aarch64", CONTAINER: "cryptography-manylinux2014_aarch64", RUNNER: [self-hosted, Linux, ARM64]}
+            MANYLINUX: { NAME: "musllinux_1_1_aarch64", CONTAINER: "cryptography-musllinux_1_1:aarch64", RUNNER: "ubuntu-24.04-arm"}
     name: "${{ matrix.PYTHON.VERSION }} for ${{ matrix.MANYLINUX.NAME }}"
     steps:
-      - name: Ridiculous alpine workaround for actions support on arm64
-        run: |
-          # This modifies /etc/os-release so the JS actions
-          # from GH can't detect that it's on alpine:aarch64. It will
-          # then use a glibc nodejs, which works fine when gcompat
-          # is installed in the container (which it is)
-          sed -i "s:ID=alpine:ID=NotpineForGHA:" /etc/os-release
-        if: matrix.MANYLINUX.NAME == 'musllinux_1_1_aarch64'
-
-      - uses: actions/download-artifact@v3.0.2
+      - uses: actions/download-artifact@v4
         with:
           name: cryptography-sdist
 
-      - run: /opt/python/${{ matrix.PYTHON.VERSION }}/bin/python -m venv .venv
-      - name: Install Python dependencies
-        run: .venv/bin/pip install -U pip wheel cffi setuptools-rust
-      - run: mkdir tmpwheelhouse
-      - name: Build the wheel
+      - name: Write the in-container build script
         run: |
-          if [ -n "${{ matrix.PYTHON.ABI_VERSION }}" ]; then
-              PY_LIMITED_API="--config-settings=--build-option=--py-limited-api=${{ matrix.PYTHON.ABI_VERSION }} --no-build-isolation"
+          cat > seal-build-manylinux.sh <<'SEAL_EOF'
+          set -eux
+          cd /io
+
+          # Inventory first: every diagnosis of this job starts with knowing
+          # which interpreters the (moving) image tag actually ships.
+          echo "=== /opt/python inventory for ${MANYLINUX_PLAT} ==="
+          ls /opt/python
+          echo "=== end inventory ==="
+
+          # PIP_CONSTRAINT must name a path that exists INSIDE the container,
+          # so the file is written into the mounted workspace.
+          # cffi is pinned < 2 as well: cffi 2.x declares PEP 639
+          # `project.license`, which the setuptools < 70.1 pinned here cannot
+          # parse ("invalid pyproject.toml config: 'project.license'"). cffi < 2
+          # is what cryptography 41.0.7 shipped against anyway.
+          printf 'setuptools<70.1\nwheel==0.42.0\ncffi<2\n' > /io/seal-constraints.txt
+          export PIP_CONSTRAINT=/io/seal-constraints.txt
+
+          # Resolve the interpreter rather than hardcoding a path: the pyca
+          # images are moving tags and have dropped cp37.
+          PYDIR=$(ls -d /opt/python/${PYTHON_PATH}* 2>/dev/null | head -1)
+          if [ -z "${PYDIR}" ]; then
+            case "${PYTHON_PATH}" in
+              cp3*)
+                # An abi3 wheel built with --py-limited-api=cp37 is identical
+                # whichever CPython 3.x produces it -- that is exactly why the
+                # green manylinux2014 legs build on cp311. Prefer cp311 (the
+                # proven one), else the newest non-freethreaded CPython.
+                PYDIR=$(ls -d /opt/python/cp311-cp311 2>/dev/null | head -1)
+                if [ -z "${PYDIR}" ]; then
+                  PYDIR=$(ls -d /opt/python/cp3*-cp3* 2>/dev/null | grep -Ev 't$' | sort -V | tail -1)
+                fi
+                ;;
+              pp3*)
+                # The image now ships only pp311; pp38/pp39/pp310 are gone, and
+                # a PyPy tag has no ABI-compatible substitute (pp311 would
+                # mislabel the wheel). So fetch the official portable PyPy for
+                # this line, exactly as the green Windows PyPy legs do. These
+                # are the newest build per line -- later minors 404.
+                case "${PYTHON_PATH}" in
+                  pp38-*)  PYPY_LINE="pypy3.8";  PYPY_VER="v7.3.11" ;;
+                  pp39-*)  PYPY_LINE="pypy3.9";  PYPY_VER="v7.3.16" ;;
+                  pp310-*) PYPY_LINE="pypy3.10"; PYPY_VER="v7.3.19" ;;
+                  *) echo "No portable PyPy mapping for '${PYTHON_PATH}'"; exit 1 ;;
+                esac
+                case "${MANYLINUX_PLAT}" in
+                  *aarch64) PYPY_ARCH="aarch64" ;;
+                  *)        PYPY_ARCH="linux64" ;;
+                esac
+                PYPY_TARBALL="${PYPY_LINE}-${PYPY_VER}-${PYPY_ARCH}.tar.bz2"
+                command -v bzip2 >/dev/null || yum install -y bzip2
+                curl -L -o "/tmp/${PYPY_TARBALL}" "https://downloads.python.org/pypy/${PYPY_TARBALL}" \
+                  || wget -O "/tmp/${PYPY_TARBALL}" "https://downloads.python.org/pypy/${PYPY_TARBALL}"
+                mkdir -p /opt/seal-pypy
+                tar -xjf "/tmp/${PYPY_TARBALL}" -C /opt/seal-pypy
+                PYDIR="/opt/seal-pypy/${PYPY_LINE}-${PYPY_VER}-${PYPY_ARCH}"
+                export PATH="${PYDIR}/bin:${PATH}"
+                # Older portable tarballs ship bin/pypy3 but no bin/python, and
+                # the build below invokes "${PYDIR}/bin/python".
+                if [ ! -e "${PYDIR}/bin/python" ]; then
+                  ln -s pypy3 "${PYDIR}/bin/python"
+                fi
+                "${PYDIR}/bin/python" -m ensurepip --upgrade
+                ;;
+            esac
           fi
-          OPENSSL_DIR="/opt/pyca/cryptography/openssl" \
+          if [ -z "${PYDIR}" ]; then
+            echo "No interpreter matching '${PYTHON_PATH}' in this image. /opt/python contains:"
+            ls /opt/python
+            exit 1
+          fi
+          echo "Using interpreter: ${PYDIR}"
+          "${PYDIR}/bin/python" -VV
+
+          # The image's bundled /opt/pyca/cryptography/openssl is now
+          # OpenSSL 4.x, which openssl-sys 0.9.88 refuses to build against.
+          curl -L -o openssl.tar.gz "$SEAL_OPENSSL_URL" || wget -O openssl.tar.gz "$SEAL_OPENSSL_URL"
+          tar zxf openssl.tar.gz
+          (cd openssl-openssl-3.1.3 && ./config no-shared no-tests -fPIC --prefix=/tmp/ossl --openssldir=/tmp/ossl && make -j"$(nproc)" && make install_sw)
+
+          "${PYDIR}/bin/python" -m venv .venv
+          # These pins are what bdist_wheel actually runs under, so the WHEEL
+          # metadata stamps `Generator: bdist_wheel (0.42.0)`.
+          .venv/bin/pip install -U pip "wheel==0.42.0" "setuptools<70.1" cffi setuptools-rust
+
+          PY_LIMITED_API=""
+          if [ -n "${ABI_VERSION:-}" ]; then
+            PY_LIMITED_API="--config-settings=--build-option=--py-limited-api=${ABI_VERSION} --no-build-isolation"
+          fi
+
+          mkdir -p tmpwheelhouse
+          OPENSSL_DIR="/tmp/ossl" \
               OPENSSL_STATIC=1 \
-              .venv/bin/python -m pip wheel -v $PY_LIMITED_API cryptograph*.tar.gz -w dist/ && mv dist/cryptography*.whl tmpwheelhouse
-        env:
-          RUSTUP_HOME: /root/.rustup
-      - run: auditwheel repair --plat ${{ matrix.MANYLINUX.NAME }} tmpwheelhouse/cryptograph*.whl -w wheelhouse/
-      - run: unzip wheelhouse/*.whl -d execstack.check
-      - run: |
+              .venv/bin/python -m pip wheel -v $PY_LIMITED_API cryptograph*.tar.gz -w dist/
+          mv dist/cryptography*.whl tmpwheelhouse
+
+          auditwheel repair --plat "$MANYLINUX_PLAT" tmpwheelhouse/cryptograph*.whl -w wheelhouse/
+          unzip wheelhouse/*.whl -d execstack.check
           results=$(readelf -lW execstack.check/cryptography/hazmat/bindings/*.so)
-          count=$(echo "$results" | grep -c 'GNU_STACK.*[R ][W ]E' || true)
+          count=$(echo "$results" | grep -c 'GNU_STACK.*[R ][W ]E') || count=0
           if [ "$count" -ne 0 ]; then
             exit 1
-          else
-            exit 0
           fi
-      - run: .venv/bin/pip install cryptography --no-index -f wheelhouse/
-      - run: |
+
+          .venv/bin/pip install cryptography --no-index -f wheelhouse/
           .venv/bin/python -c "from cryptography.hazmat.backends.openssl.backend import backend;print('Loaded: ' + backend.openssl_version_text());print('Linked Against: ' + backend._ffi.string(backend._lib.OPENSSL_VERSION_TEXT).decode('ascii'))"
-      - run: mkdir cryptography-wheelhouse
-      - run: mv wheelhouse/cryptography*.whl cryptography-wheelhouse/
-      - uses: actions/upload-artifact@v3.1.2
+
+          mkdir -p cryptography-wheelhouse
+          mv wheelhouse/cryptography*.whl cryptography-wheelhouse/
+          ls -la cryptography-wheelhouse/
+          # The host runner (uid 1001) has to read what root wrote.
+          chmod -R a+rX cryptography-wheelhouse
+          SEAL_EOF
+      - name: Build the wheel inside the pinned image
+        run: |
+          set -e
+          docker run --rm \
+            -v "$PWD":/io -w /io \
+            -e MANYLINUX_PLAT="${{ matrix.MANYLINUX.NAME }}" \
+            -e PYTHON_PATH="${{ matrix.PYTHON.VERSION }}" \
+            -e ABI_VERSION="${{ matrix.PYTHON.ABI_VERSION }}" \
+            -e SEAL_OPENSSL_URL="$SEAL_OPENSSL_URL" \
+            -e RUSTUP_HOME=/root/.rustup \
+            ghcr.io/pyca/${{ matrix.MANYLINUX.CONTAINER }} \
+            bash /io/seal-build-manylinux.sh
+      - uses: actions/upload-artifact@v4
         with:
-          name: "cryptography-${{ github.event.inputs.version }}-${{ matrix.MANYLINUX.NAME }}-${{ matrix.PYTHON.VERSION }}"
+          name: "cryptography-${{ matrix.MANYLINUX.NAME }}-${{ matrix.PYTHON.VERSION }}"
           path: cryptography-wheelhouse/
+          if-no-files-found: error
+
+  manylinux2014:
+    # NOT a container job: GitHub runs JS actions with Node 24, which needs
+    # glibc >= 2.28, and manylinux2014 is CentOS 7 (glibc 2.17) --
+    # actions/download-artifact dies before any build runs. So the JS actions
+    # run on the host and the identical build happens inside the pinned image
+    # via `docker run`.
+    needs: [sdist]
+    runs-on: ${{ matrix.MANYLINUX.RUNNER }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        MANYLINUX:
+          - { NAME: "manylinux2014_x86_64", CONTAINER: "cryptography-manylinux2014:x86_64", RUNNER: "ubuntu-latest" }
+          - { NAME: "manylinux2014_aarch64", CONTAINER: "cryptography-manylinux2014_aarch64", RUNNER: "ubuntu-24.04-arm" }
+    name: "cp37-cp37m for ${{ matrix.MANYLINUX.NAME }}"
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cryptography-sdist
+
+      - name: Write the in-container build script
+        run: |
+          cat > seal-build-manylinux2014.sh <<'SEAL_EOF'
+          set -eux
+          cd /io
+
+          # cffi < 2 keeps setuptools < 70.1 from having to parse cffi 2.x's
+          # PEP 639 `project.license`.
+          printf 'setuptools<70.1\nwheel==0.42.0\ncffi<2\n' > /tmp/seal-constraints.txt
+          export PIP_CONSTRAINT=/tmp/seal-constraints.txt
+
+          # The container's bundled /opt/pyca/cryptography/openssl is now
+          # OpenSSL 4.x, which openssl-sys 0.9.88 refuses to build against.
+          curl -L -o openssl.tar.gz "$SEAL_OPENSSL_URL" || wget -O openssl.tar.gz "$SEAL_OPENSSL_URL"
+          tar zxf openssl.tar.gz
+          (cd openssl-openssl-3.1.3 && ./config no-shared no-tests -fPIC --prefix=/tmp/ossl --openssldir=/tmp/ossl && make -j"$(nproc)" && make install_sw)
+
+          /opt/python/cp311-cp311/bin/python -m venv .venv
+          .venv/bin/pip install -U pip "wheel==0.42.0" "setuptools<70.1" cffi setuptools-rust
+
+          mkdir -p tmpwheelhouse
+          OPENSSL_DIR="/tmp/ossl" \
+              OPENSSL_STATIC=1 \
+              .venv/bin/python -m pip wheel -v --config-settings=--build-option=--py-limited-api=cp37 --no-build-isolation cryptograph*.tar.gz -w dist/
+          mv dist/cryptography*.whl tmpwheelhouse
+
+          auditwheel repair --plat "$MANYLINUX_PLAT" tmpwheelhouse/cryptograph*.whl -w wheelhouse/
+          unzip wheelhouse/*.whl -d execstack.check
+          results=$(readelf -lW execstack.check/cryptography/hazmat/bindings/*.so)
+          count=$(echo "$results" | grep -c 'GNU_STACK.*[R ][W ]E') || count=0
+          if [ "$count" -ne 0 ]; then
+            exit 1
+          fi
+
+          .venv/bin/pip install cryptography --no-index -f wheelhouse/
+          .venv/bin/python -c "from cryptography.hazmat.backends.openssl.backend import backend;print('Loaded: ' + backend.openssl_version_text());print('Linked Against: ' + backend._ffi.string(backend._lib.OPENSSL_VERSION_TEXT).decode('ascii'))"
+
+          mkdir -p cryptography-wheelhouse
+          mv wheelhouse/cryptography*.whl cryptography-wheelhouse/
+          # The host runner (uid 1001) has to read what root wrote.
+          chmod -R a+rX cryptography-wheelhouse
+          SEAL_EOF
+      - name: Build the wheel inside the manylinux2014 image
+        run: |
+          set -e
+          docker run --rm \
+            -v "$PWD":/io -w /io \
+            -e MANYLINUX_PLAT="${{ matrix.MANYLINUX.NAME }}" \
+            -e SEAL_OPENSSL_URL="$SEAL_OPENSSL_URL" \
+            -e RUSTUP_HOME=/root/.rustup \
+            ghcr.io/pyca/${{ matrix.MANYLINUX.CONTAINER }} \
+            bash /io/seal-build-manylinux2014.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "cryptography-${{ matrix.MANYLINUX.NAME }}-cp37-cp37m"
+          path: cryptography-wheelhouse/
+          if-no-files-found: error
 
   macos:
     needs: [sdist]
-    runs-on: macos-12
+    # Per-leg runner. macos-latest is arm64 (macos-26-arm64), where the
+    # post-build `pip install cryptography --no-index -f wheelhouse/` smoke test
+    # cannot install an x86_64-only wheel, so every `-arch x86_64` leg died with
+    # "No matching distribution found" after building the wheel just fine.
+    # Those legs move to a real Intel host. macos-13 is retired (fully
+    # unsupported since Dec 2025); macos-15-intel is its documented x86_64
+    # replacement and is available until Aug 2027.
+    runs-on: ${{ matrix.PYTHON.RUNNER }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         PYTHON:
           - VERSION: '3.11'
             ABI_VERSION: 'cp37'
+            NAME: 'cp37-macosx_universal2'
+            # universal2 installs on arm64, so this leg stays where it is green.
+            RUNNER: 'macos-latest'
             # Despite the name, this is built for the macOS 11 SDK on arm64 and 10.9+ on intel
             DOWNLOAD_URL: 'https://www.python.org/ftp/python/3.11.3/python-3.11.3-macos11.pkg'
             BIN_PATH: '/Library/Frameworks/Python.framework/Versions/3.11/bin/python3'
@@ -166,6 +350,7 @@ jobs:
             _PYTHON_HOST_PLATFORM: 'macosx-10.9-universal2'
           - VERSION: '3.11'
             ABI_VERSION: 'cp37'
+            NAME: 'cp37-macosx_x86_64'
             DOWNLOAD_URL: 'https://www.python.org/ftp/python/3.11.3/python-3.11.3-macos11.pkg'
             BIN_PATH: '/Library/Frameworks/Python.framework/Versions/3.11/bin/python3'
             DEPLOYMENT_TARGET: '10.12'
@@ -174,24 +359,40 @@ jobs:
             # requires a 21.x pip)
             ARCHFLAGS: '-arch x86_64'
             _PYTHON_HOST_PLATFORM: 'macosx-10.9-x86_64'
+            RUNNER: 'macos-15-intel'
           - VERSION: 'pypy-3.8'
+            NAME: 'pp38-macosx_x86_64'
             BIN_PATH: 'pypy3'
             DEPLOYMENT_TARGET: '10.12'
             _PYTHON_HOST_PLATFORM: 'macosx-10.9-x86_64'
             ARCHFLAGS: '-arch x86_64'
+            RUNNER: 'macos-15-intel'
+          # actions/setup-python has no macOS PyPy 3.9/3.10 build for
+          # macos-15-intel ("PyPy version 3.9 (x) was not found in the local
+          # cache"), so these two download the official portable PyPy directly,
+          # the same pattern as the green Windows PyPy legs. The pypy-3.8 leg
+          # above still resolves from the tool cache, so it is left as it was.
           - VERSION: 'pypy-3.9'
+            NAME: 'pp39-macosx_x86_64'
             BIN_PATH: 'pypy3'
+            PYPY_DIR: 'pypy3.9-v7.3.16-macos_x86_64'
+            PYPY_URL: 'https://downloads.python.org/pypy/pypy3.9-v7.3.16-macos_x86_64.tar.bz2'
             DEPLOYMENT_TARGET: '10.12'
             _PYTHON_HOST_PLATFORM: 'macosx-10.9-x86_64'
             ARCHFLAGS: '-arch x86_64'
+            RUNNER: 'macos-15-intel'
           - VERSION: 'pypy-3.10'
+            NAME: 'pp310-macosx_x86_64'
             BIN_PATH: 'pypy3'
+            PYPY_DIR: 'pypy3.10-v7.3.19-macos_x86_64'
+            PYPY_URL: 'https://downloads.python.org/pypy/pypy3.10-v7.3.19-macos_x86_64.tar.bz2'
             DEPLOYMENT_TARGET: '10.12'
             _PYTHON_HOST_PLATFORM: 'macosx-10.9-x86_64'
             ARCHFLAGS: '-arch x86_64'
+            RUNNER: 'macos-15-intel'
     name: "${{ matrix.PYTHON.VERSION }} ABI ${{ matrix.PYTHON.ABI_VERSION }} macOS ${{ matrix.PYTHON.ARCHFLAGS }}"
     steps:
-      - uses: actions/download-artifact@v3.0.2
+      - uses: actions/download-artifact@v4
         with:
           name: cryptography-sdist
 
@@ -203,27 +404,77 @@ jobs:
           PYTHON_DOWNLOAD_URL: ${{ matrix.PYTHON.DOWNLOAD_URL }}
         if: contains(matrix.PYTHON.VERSION, 'pypy') == false
       - name: Setup pypy
-        uses: actions/setup-python@v4.6.1
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.PYTHON.VERSION }}
-        if: contains(matrix.PYTHON.VERSION, 'pypy')
-      - uses: dawidd6/action-download-artifact@246dbf436b23d7c49e21a7ab8204ca9ecd1fe615
-        with:
-          repo: pyca/infra
-          workflow: build-macos-openssl.yml
-          branch: main
-          workflow_conclusion: success
-          name: openssl-macos-universal2
-          path: "../openssl-macos-universal2/"
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+        if: contains(matrix.PYTHON.VERSION, 'pypy') && matrix.PYTHON.PYPY_URL == ''
+      - name: Setup portable pypy
+        run: |
+          set -e
+          curl -L -o "${RUNNER_TEMP}/pypy.tar.bz2" "$PYPY_URL"
+          mkdir -p "${HOME}/pypy"
+          tar -xjf "${RUNNER_TEMP}/pypy.tar.bz2" -C "${HOME}/pypy"
+          echo "${HOME}/pypy/${PYPY_DIR}/bin" >> $GITHUB_PATH
+        env:
+          PYPY_URL: ${{ matrix.PYTHON.PYPY_URL }}
+          PYPY_DIR: ${{ matrix.PYTHON.PYPY_DIR }}
+        if: matrix.PYTHON.PYPY_URL != ''
+      - name: Bootstrap pip into the portable pypy
+        run: pypy3 -m ensurepip --upgrade
+        if: matrix.PYTHON.PYPY_URL != ''
+      - name: Build OpenSSL 3.1.3 (universal2)
+        run: |
+          set -e
+          # pyca/infra now publishes OpenSSL 4.x, which openssl-sys 0.9.88
+          # refuses to build against, so build 3.1.3 for both arches and lipo
+          # them into a universal2 prefix.
+          curl -L -o openssl.tar.gz "$SEAL_OPENSSL_URL"
+          tar zxf openssl.tar.gz
+          SRC="$PWD/openssl-openssl-3.1.3"
+          for OSSL_ARCH in x86_64 arm64; do
+            if [ "$OSSL_ARCH" = "x86_64" ]; then
+              OSSL_TARGET="darwin64-x86_64-cc"
+              # arm64 only exists from macOS 11 on, so each half gets the
+              # oldest deployment target that is valid for it.
+              OSSL_MIN="10.12"
+            else
+              OSSL_TARGET="darwin64-arm64-cc"
+              OSSL_MIN="11.0"
+            fi
+            rm -rf "$SRC/build-$OSSL_ARCH"
+            mkdir -p "$SRC/build-$OSSL_ARCH"
+            (
+              cd "$SRC/build-$OSSL_ARCH"
+              perl ../Configure "$OSSL_TARGET" no-shared no-tests \
+                --prefix="$HOME/ossl-$OSSL_ARCH" --openssldir="$HOME/ossl-$OSSL_ARCH" \
+                "-mmacosx-version-min=$OSSL_MIN"
+              make -j"$(sysctl -n hw.ncpu)"
+              make install_sw
+            )
+          done
+          rm -rf "$HOME/openssl-macos-universal2"
+          mkdir -p "$HOME/openssl-macos-universal2/lib"
+          cp -R "$HOME/ossl-arm64/include" "$HOME/openssl-macos-universal2/include"
+          for OSSL_LIB in libssl.a libcrypto.a; do
+            lipo -create "$HOME/ossl-x86_64/lib/$OSSL_LIB" "$HOME/ossl-arm64/lib/$OSSL_LIB" \
+              -output "$HOME/openssl-macos-universal2/lib/$OSSL_LIB"
+          done
+          echo "SEAL_OPENSSL_DIR=$HOME/openssl-macos-universal2" >> $GITHUB_ENV
       - uses: dtolnay/rust-toolchain@52e69531e6f69a396bc9d1226284493a5db969ff
         with:
           toolchain: stable
-          # Add the arm64 target in addition to the native arch (x86_64)
-          target: aarch64-apple-darwin
+          # The job spans an arm64 host (macos-latest, universal2 leg) and an
+          # x86_64 host (macos-15-intel legs), and the universal2 leg builds
+          # both halves, so both targets are installed on every leg regardless
+          # of which one is native (upstream only added aarch64).
+          target: x86_64-apple-darwin,aarch64-apple-darwin
 
+      - name: Pin the wheel Generator toolchain
+        run: |
+          printf '%s\n%s\n%s\n' "$SEAL_SETUPTOOLS_PIN" "$SEAL_WHEEL_PIN" "$SEAL_CFFI_PIN" > "${{ github.workspace }}/seal-constraints.txt"
+          echo "PIP_CONSTRAINT=${{ github.workspace }}/seal-constraints.txt" >> $GITHUB_ENV
       - run: ${{ matrix.PYTHON.BIN_PATH }} -m venv venv
-      - run: venv/bin/pip install -U pip wheel cffi setuptools-rust
+      - run: venv/bin/pip install -U pip "$SEAL_WHEEL_PIN" "$SEAL_SETUPTOOLS_PIN" cffi setuptools-rust
       - run: mkdir wheelhouse
       - name: Build the wheel
         run: |
@@ -231,7 +482,7 @@ jobs:
               PY_LIMITED_API="--config-settings=--build-option=--py-limited-api=${{ matrix.PYTHON.ABI_VERSION }} --no-build-isolation"
           fi
 
-          OPENSSL_DIR="$(readlink -f ../openssl-macos-universal2/)" \
+          OPENSSL_DIR="${SEAL_OPENSSL_DIR}" \
               OPENSSL_STATIC=1 \
               venv/bin/python -m pip wheel -v $PY_LIMITED_API cryptograph*.tar.gz -w dist/ && mv dist/cryptography*.whl wheelhouse
         env:
@@ -247,84 +498,128 @@ jobs:
 
       - run: mkdir cryptography-wheelhouse
       - run: mv wheelhouse/cryptography*.whl cryptography-wheelhouse/
-      - run: |
-          echo "CRYPTOGRAPHY_WHEEL_NAME=$(basename $(ls cryptography-wheelhouse/cryptography*.whl))" >> $GITHUB_ENV
-      - uses: actions/upload-artifact@v3.1.2
+      - uses: actions/upload-artifact@v4
         with:
-          name: "${{ env.CRYPTOGRAPHY_WHEEL_NAME }}"
+          name: "cryptography-macos-${{ matrix.PYTHON.NAME }}"
           path: cryptography-wheelhouse/
+          if-no-files-found: error
 
   windows:
     needs: [sdist]
     runs-on: windows-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         WINDOWS:
-          - {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc'}
-          - {ARCH: 'x64', WINDOWS: 'win64', RUST_TRIPLE: 'x86_64-pc-windows-msvc'}
+          - {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc', MSVC_ARCH: 'x86', OPENSSL_TARGET: 'VC-WIN32'}
+          - {ARCH: 'x64', WINDOWS: 'win64', RUST_TRIPLE: 'x86_64-pc-windows-msvc', MSVC_ARCH: 'amd64', OPENSSL_TARGET: 'VC-WIN64A'}
         PYTHON:
           - {VERSION: "3.11", "ABI_VERSION": "cp37"}
-          - {VERSION: "pypy-3.8"}
-          - {VERSION: "pypy-3.9"}
-          - {VERSION: "pypy-3.10"}
+          # actions/setup-python only has 32-bit PyPy on Windows, which cannot
+          # link against 64-bit OpenSSL/Rust, so PyPy is downloaded directly.
+          - {VERSION: "pypy-3.8", PYPY_DIR: "pypy3.8-v7.3.11-win64", PYPY_URL: "https://downloads.python.org/pypy/pypy3.8-v7.3.11-win64.zip"}
+          - {VERSION: "pypy-3.9", PYPY_DIR: "pypy3.9-v7.3.16-win64", PYPY_URL: "https://downloads.python.org/pypy/pypy3.9-v7.3.16-win64.zip"}
+          - {VERSION: "pypy-3.10", PYPY_DIR: "pypy3.10-v7.3.19-win64", PYPY_URL: "https://downloads.python.org/pypy/pypy3.10-v7.3.19-win64.zip"}
         exclude:
           # We need to exclude the below configuration because there is no 32-bit pypy3
-          - WINDOWS: {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc'}
-            PYTHON: {VERSION: "pypy-3.8"}
-          - WINDOWS: {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc'}
-            PYTHON: {VERSION: "pypy-3.9"}
-          - WINDOWS: {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc'}
-            PYTHON: {VERSION: "pypy-3.10"}
+          - WINDOWS: {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc', MSVC_ARCH: 'x86', OPENSSL_TARGET: 'VC-WIN32'}
+            PYTHON: {VERSION: "pypy-3.8", PYPY_DIR: "pypy3.8-v7.3.11-win64", PYPY_URL: "https://downloads.python.org/pypy/pypy3.8-v7.3.11-win64.zip"}
+          - WINDOWS: {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc', MSVC_ARCH: 'x86', OPENSSL_TARGET: 'VC-WIN32'}
+            PYTHON: {VERSION: "pypy-3.9", PYPY_DIR: "pypy3.9-v7.3.16-win64", PYPY_URL: "https://downloads.python.org/pypy/pypy3.9-v7.3.16-win64.zip"}
+          - WINDOWS: {ARCH: 'x86', WINDOWS: 'win32', RUST_TRIPLE: 'i686-pc-windows-msvc', MSVC_ARCH: 'x86', OPENSSL_TARGET: 'VC-WIN32'}
+            PYTHON: {VERSION: "pypy-3.10", PYPY_DIR: "pypy3.10-v7.3.19-win64", PYPY_URL: "https://downloads.python.org/pypy/pypy3.10-v7.3.19-win64.zip"}
     name: "${{ matrix.PYTHON.VERSION }} ${{ matrix.WINDOWS.WINDOWS }} ${{ matrix.PYTHON.ABI_VERSION }}"
+    env:
+      # PyPy's bundled cffi shim imports distutils.msvc9compiler, which
+      # setuptools' local _distutils does not carry.
+      SETUPTOOLS_USE_DISTUTILS: ${{ contains(matrix.PYTHON.VERSION, 'pypy') && 'stdlib' || '' }}
     steps:
-      - uses: actions/download-artifact@v3.0.2
+      - uses: actions/download-artifact@v4
         with:
           name: cryptography-sdist
 
       - name: Setup python
-        uses: actions/setup-python@v4.6.1
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.PYTHON.VERSION }}
           architecture: ${{ matrix.WINDOWS.ARCH }}
+        if: contains(matrix.PYTHON.VERSION, 'pypy') == false
+      - name: Setup 64-bit pypy
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ matrix.PYTHON.PYPY_URL }}" -OutFile "$env:RUNNER_TEMP\pypy.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\pypy.zip" -DestinationPath "C:\pypy"
+          $pypyDir = "C:\pypy\${{ matrix.PYTHON.PYPY_DIR }}"
+          Copy-Item "$pypyDir\pypy.exe" "$pypyDir\python.exe"
+          Add-Content -Path $env:GITHUB_PATH -Value $pypyDir
+        if: contains(matrix.PYTHON.VERSION, 'pypy')
+      - name: Bootstrap pip into the portable pypy
+        run: python -m ensurepip --upgrade
+        if: contains(matrix.PYTHON.VERSION, 'pypy')
+
       - uses: dtolnay/rust-toolchain@52e69531e6f69a396bc9d1226284493a5db969ff
         with:
           toolchain: stable
           target: ${{ matrix.WINDOWS.RUST_TRIPLE }}
 
-      - uses: dawidd6/action-download-artifact@246dbf436b23d7c49e21a7ab8204ca9ecd1fe615
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          repo: pyca/infra
-          workflow: build-windows-openssl.yml
-          branch: main
-          workflow_conclusion: success
-          name: "openssl-${{ matrix.WINDOWS.WINDOWS }}"
-          path: "C:/openssl-${{ matrix.WINDOWS.WINDOWS }}/"
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          arch: ${{ matrix.WINDOWS.MSVC_ARCH }}
+      - name: Build OpenSSL 3.1.3
+        shell: cmd
+        run: |
+          curl -L -o openssl.tar.gz "%SEAL_OPENSSL_URL%" || exit /b 1
+          tar zxf openssl.tar.gz || exit /b 1
+          cd openssl-openssl-3.1.3 || exit /b 1
+          perl Configure ${{ matrix.WINDOWS.OPENSSL_TARGET }} no-shared no-tests --prefix=C:\openssl-${{ matrix.WINDOWS.WINDOWS }} --openssldir=C:\openssl-${{ matrix.WINDOWS.WINDOWS }} || exit /b 1
+          nmake build_sw || exit /b 1
+          nmake install_sw || exit /b 1
       - name: Configure OpenSSL
         run: |
             echo "OPENSSL_DIR=C:/openssl-${{ matrix.WINDOWS.WINDOWS }}" >> $GITHUB_ENV
             echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
         shell: bash
 
-      - run: python -m pip install -U pip wheel
+      # Wheel Generator parity: setuptools >= 70.1 stamps `setuptools (<ver>)`
+      # into WHEEL; the public wheels carry `bdist_wheel (0.42.0)`. Every
+      # Windows leg builds with --no-build-isolation, so these pins are the
+      # ones bdist_wheel actually runs under.
+      - run: python -m pip install -U pip "wheel==0.42.0" "setuptools<70.1"
       - run: python -m pip install cffi setuptools-rust
       - run: mkdir wheelhouse
       - run: |
+          set -e
+          # Git-bash's coreutils `link` shadows MSVC's link.exe and chokes on
+          # the UTF-16 .def file.
+          rm -f "/usr/bin/link" "/usr/bin/link.exe"
+
           if [ -n "${{ matrix.PYTHON.ABI_VERSION }}" ]; then
-              PY_LIMITED_API="--config-settings=--build-option=--py-limited-api=${{ matrix.PYTHON.ABI_VERSION }} --no-build-isolation"
+              PY_LIMITED_API="--config-settings=--build-option=--py-limited-api=${{ matrix.PYTHON.ABI_VERSION }}"
           fi
 
-          python -m pip wheel -v cryptography*.tar.gz $PY_LIMITED_API -w dist/ && mv dist/cryptography*.whl wheelhouse/
+          python -m pip wheel -v --no-deps cryptography*.tar.gz $PY_LIMITED_API --no-build-isolation -w wheelhouse/
         shell: bash
-      - run: pip install -f wheelhouse --no-index cryptography
+      - name: Show what landed in wheelhouse
+        run: ls -la wheelhouse/
+        shell: bash
+      # `python -m pip`, not bare `pip`: PyPy is unpacked to C:\pypy\<dir> and
+      # only that dir goes on PATH, not its Scripts\ -- so bare `pip` resolved
+      # to the hosted CPython 3.12, which cannot install a
+      # pp3x-pypy3x_pp73-win_amd64 wheel ("from versions: none") even though the
+      # build had just produced one. `python` is the interpreter that built the
+      # wheel on every leg; on the CPython legs `python`/`pip` are the same
+      # setup-python install, so those keep their existing behaviour.
+      - run: python -m pip install -f wheelhouse --no-index cryptography
       - name: Print the OpenSSL we built and linked against
         run: |
             python -c "from cryptography.hazmat.backends.openssl.backend import backend;print('Loaded: ' + backend.openssl_version_text());print('Linked Against: ' + backend._ffi.string(backend._lib.OPENSSL_VERSION_TEXT).decode('ascii'))"
 
       - run: mkdir cryptography-wheelhouse
       - run: move wheelhouse\cryptography*.whl cryptography-wheelhouse\
-      - uses: actions/upload-artifact@v3.1.2
+      - uses: actions/upload-artifact@v4
         with:
-          name: "cryptography-${{ github.event.inputs.version }}-${{ matrix.WINDOWS.WINDOWS }}-${{ matrix.PYTHON.VERSION }}-${{ matrix.PYTHON.ABI_VERSION}}"
+          name: "cryptography-${{ matrix.WINDOWS.WINDOWS }}-${{ matrix.PYTHON.VERSION }}-${{ matrix.PYTHON.ABI_VERSION }}"
           path: cryptography-wheelhouse\
+          if-no-files-found: error

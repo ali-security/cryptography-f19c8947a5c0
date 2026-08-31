@@ -4,12 +4,10 @@ permissions:
 
 on:
   workflow_dispatch:
-  schedule:
-    # Run daily
-    - cron: "0 0 * * *"
 
 jobs:
   bump:
+    timeout-minutes: 15
     if: github.repository_owner == 'pyca'
     runs-on: ubuntu-latest
     steps:
